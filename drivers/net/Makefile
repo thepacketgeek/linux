@@ -22,7 +22,11 @@ obj-$(CONFIG_MII) += mii.o
 obj-$(CONFIG_MDIO) += mdio.o
 obj-$(CONFIG_NET) += loopback.o
 obj-$(CONFIG_NETDEV_LEGACY_INIT) += Space.o
+ifdef CONFIG_NETCONSOLE_RUST
+obj-$(CONFIG_NETCONSOLE) += netconsole_rust.o
+else
 obj-$(CONFIG_NETCONSOLE) += netconsole.o
+endif
 obj-$(CONFIG_NETKIT) += netkit.o
 obj-y += phy/
 obj-y += pse-pd/

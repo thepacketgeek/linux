@@ -11,7 +11,6 @@
 //! - Items. All group children are groups.
 //! - Symlink support.
 //! - `disconnect_notify` hook.
-//! - Default groups.
 //!
 //! See the [`rust_configfs.rs`] sample for a full example use of this module.
 //!
@@ -120,6 +119,25 @@ use crate::types::Opaque;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 
+/// Adds an entry to the tail of a list.
+///
+/// This is a Rust implementation of the inline C function `list_add_tail`.
+///
+/// # Safety
+///
+/// - `new` and `head` must be valid pointers to initialized `list_head` structs.
+/// - `new` must not already be in a list.
+unsafe fn list_add_tail(new: *mut bindings::list_head, head: *mut bindings::list_head) {
+    // SAFETY: By function safety requirements, pointers are valid.
+    unsafe {
+        let prev = (*head).prev;
+        (*new).next = head;
+        (*new).prev = prev;
+        (*prev).next = new;
+        (*head).prev = new;
+    }
+}
+
 /// A configfs subsystem.
 ///
 /// This is the top level entrypoint for a configfs hierarchy. To register
@@ -139,6 +157,16 @@ unsafe impl<Data> Sync for Subsystem<Data> {}
 unsafe impl<Data> Send for Subsystem<Data> {}
 
 impl<Data> Subsystem<Data> {
+    /// Returns a pointer to the subsystem's root config_group.
+    ///
+    /// # Safety
+    ///
+    /// The subsystem must be initialized.
+    pub fn group(&self) -> *mut bindings::config_group {
+        // SAFETY: The subsystem is initialized.
+        unsafe { &raw mut (*self.subsystem.get()).su_group }
+    }
+
     /// Create an initializer for a [`Subsystem`].
     ///
     /// The subsystem will appear in configfs as a directory name given by
@@ -191,6 +219,31 @@ impl<Data> PinnedDrop for Subsystem<Data> {
         // SAFETY: We initialized the mutex in `Subsystem::new`.
         unsafe { bindings::mutex_destroy(&raw mut (*self.subsystem.get()).su_mutex) };
     }
+}
+
+/// Registers a group with configfs under a parent group.
+///
+/// # Safety
+///
+/// - `parent` must be a valid registered config_group
+/// - `child` must be a valid initialized config_group
+/// - `child` must not already be registered
+pub unsafe fn register_group(
+    parent: *mut bindings::config_group,
+    child: *mut bindings::config_group,
+) -> Result {
+    // SAFETY: By function safety requirements.
+    crate::error::to_result(unsafe { bindings::configfs_register_group(parent, child) })
+}
+
+/// Unregisters a group from configfs.
+///
+/// # Safety
+///
+/// - `group` must have been registered with `register_group`
+pub unsafe fn unregister_group(group: *mut bindings::config_group) {
+    // SAFETY: By function safety requirements.
+    unsafe { bindings::configfs_unregister_group(group) }
 }
 
 /// Trait that allows offset calculations for structs that embed a
@@ -249,6 +302,12 @@ pub struct Group<Data> {
     data: Data,
 }
 
+// SAFETY: We do not provide any operations on `Group` that need synchronization.
+unsafe impl<Data> Sync for Group<Data> where Data: Sync {}
+
+// SAFETY: Ownership of `Group` can safely be transferred to other threads.
+unsafe impl<Data> Send for Group<Data> where Data: Send {}
+
 impl<Data> Group<Data> {
     /// Create an initializer for a new group.
     ///
@@ -271,6 +330,81 @@ impl<Data> Group<Data> {
             }),
             data <- data,
         })
+    }
+
+    /// Create an initializer for an embedded group with a static name.
+    ///
+    /// This is similar to [`Group::new`] but takes a static `CStr` instead of
+    /// an allocated `CString`, which is useful for default groups that are
+    /// embedded in parent structures.
+    pub fn new_embedded(
+        name: &'static CStr,
+        item_type: &'static ItemType<Group<Data>, Data>,
+        data: impl PinInit<Data, Error>,
+    ) -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            group <- pin_init::init_zeroed().chain(|v: &mut Opaque<bindings::config_group>| {
+                let place = v.get();
+                // SAFETY: It is safe to initialize a group once it has been zeroed.
+                unsafe {
+                    bindings::config_group_init_type_name(place, name.as_char_ptr(), item_type.as_ptr())
+                };
+                Ok(())
+            }),
+            data <- data,
+        })
+    }
+
+    /// Returns a reference to the data embedded in this group.
+    pub fn data(self: Pin<&Self>) -> &Data {
+        &self.get_ref().data
+    }
+
+    /// Returns a raw pointer to the data embedded in this group.
+    ///
+    /// # Safety
+    ///
+    /// `this` must be a valid pointer to an initialized [`Group`].
+    pub unsafe fn data_ptr(this: *const Self) -> *const Data {
+        // SAFETY: By function safety requirements this field
+        // projection is within bounds of the allocation.
+        unsafe { &raw const (*this).data }
+    }
+
+    /// Returns a pointer to the embedded `config_group`.
+    ///
+    /// # Safety
+    ///
+    /// `this` must be a valid pointer to an initialized [`Group`].
+    pub unsafe fn group(this: *const Self) -> *const bindings::config_group {
+        Opaque::cast_into(
+            // SAFETY: By function safety requirements this field
+            // projection is within bounds of the allocation.
+            unsafe { &raw const (*this).group },
+        )
+    }
+
+    /// Adds a child group as a default group.
+    ///
+    /// Default groups are automatically created when the parent group is
+    /// attached to configfs, without requiring user `mkdir`.
+    ///
+    /// # Safety
+    ///
+    /// - Both groups must be pinned and their group fields must be initialized.
+    /// - `child` must outlive `self`.
+    /// - This must be called before the parent group is attached to configfs.
+    pub unsafe fn add_default_group<ChildData>(self: Pin<&Self>, child: Pin<&Group<ChildData>>) {
+        // SAFETY: By function safety requirements, both groups are initialized.
+        unsafe {
+            let parent_group = Self::group(self.get_ref()).cast_mut();
+            let child_group = Group::<ChildData>::group(child.get_ref()).cast_mut();
+
+            list_add_tail(
+                &raw mut (*child_group).group_entry,
+                &raw mut (*parent_group).default_groups,
+            );
+        }
     }
 }
 
@@ -787,7 +921,8 @@ impl_item_type!(Subsystem<Data>);
 impl_item_type!(Group<Data>);
 
 impl<Container, Data> ItemType<Container, Data> {
-    fn as_ptr(&self) -> *const bindings::config_item_type {
+    /// Returns a pointer to the underlying `config_item_type`.
+    pub fn as_ptr(&self) -> *const bindings::config_item_type {
         self.item_type.get()
     }
 }

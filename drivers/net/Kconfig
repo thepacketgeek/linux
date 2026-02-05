@@ -371,6 +371,29 @@ config NETCONSOLE_PREPEND_RELEASE
 	  message.  See <file:Documentation/networking/netconsole.rst> for
 	  details.
 
+choice
+	prompt "Netconsole implementation"
+	depends on NETCONSOLE
+	default NETCONSOLE_C
+
+config NETCONSOLE_C
+	bool "C implementation"
+	help
+	  Use the traditional C implementation of netconsole.
+
+config NETCONSOLE_RUST
+	bool "Rust implementation"
+	depends on RUST && CONFIGFS_FS
+	help
+	  Use the Rust implementation of netconsole. This provides the same
+	  functionality as the C implementation but is written in Rust for
+	  improved memory safety.
+
+	  Note: This is experimental and may not support all features of
+	  the C implementation yet.
+
+endchoice
+
 config NETPOLL
 	def_bool NETCONSOLE
 
