@@ -11,6 +11,7 @@ use core::ops::Deref;
 use core::pin::Pin;
 use kernel::{
     alloc::flags,
+    bindings,
     c_str,
     configfs::{self, configfs_attrs},
     console::{flags as console_flags, Console, ConsoleOps},
@@ -46,6 +47,13 @@ module! {
 
 const DEFAULT_LOCAL_PORT: u16 = 6665;
 const DEFAULT_REMOTE_PORT: u16 = 6666;
+
+/// Sysdata feature bitflags (matching C's `enum sysdata_feature`).
+const SYSDATA_CPU_NR: u32 = 1 << 0;
+const SYSDATA_TASKNAME: u32 = 1 << 1;
+const SYSDATA_RELEASE: u32 = 1 << 2;
+const SYSDATA_MSGID: u32 = 1 << 3;
+const MAX_SYSDATA_ITEMS: usize = 4;
 
 /// Maximum length of a userdata value.
 const MAX_EXTRADATA_VALUE_LEN: usize = 200;
@@ -107,6 +115,12 @@ struct NetconsoleTarget {
     /// Pre-formatted userdata cache for message sending.
     #[pin]
     userdata_cache: SpinLock<UserdataCache>,
+    /// Sysdata feature flags (bitwise OR of SYSDATA_* constants).
+    #[pin]
+    sysdata_fields: SpinLock<u32>,
+    /// Per-target message counter for msgid sysdata feature.
+    #[pin]
+    msg_counter: SpinLock<u32>,
     /// Embedded userdata group (contains both config_group and Userdata).
     #[pin]
     userdata_group: configfs::Group<Userdata>,
@@ -507,19 +521,21 @@ impl CmdlineConfigHolder {
 
 static CMDLINE_CONFIGS: CmdlineConfigHolder = CmdlineConfigHolder::new();
 
-/// Static item type for the embedded userdata group.
-/// This is used for the default userdata group that's automatically created.
-static USERDATA_ITEM_TYPE: configfs::ItemType<configfs::Group<Userdata>, Userdata> = {
-    // Create an empty attribute list for userdata (no attributes on the userdata group itself)
-    static USERDATA_ATTRS: configfs::AttributeList<1, Userdata> =
-        // SAFETY: This is a static initialization.
-        unsafe { configfs::AttributeList::new() };
-
-    configfs::ItemType::<configfs::Group<Userdata>, Userdata>::new_with_child_ctor::<1, UserdataEntry>(
-        &THIS_MODULE,
-        &USERDATA_ATTRS,
-    )
-};
+/// Item type for the embedded userdata group.
+/// This defines the sysdata feature attributes on the userdata group.
+fn userdata_item_type() -> &'static configfs::ItemType<configfs::Group<Userdata>, Userdata> {
+    configfs_attrs! {
+        container: configfs::Group<Userdata>,
+        data: Userdata,
+        child: UserdataEntry,
+        attributes: [
+            cpu_nr_enabled: 0,
+            taskname_enabled: 1,
+            release_enabled: 2,
+            msgid_enabled: 3,
+        ],
+    }
+}
 
 /// Static item type for cmdline-created targets.
 /// This defines the attributes available on a target created via cmdline.
@@ -590,9 +606,11 @@ impl NetconsoleTarget {
             netpoll <- new_spinlock!(None),
             xmit_errors <- new_spinlock!(0u64),
             userdata_cache <- new_spinlock!(UserdataCache::new()),
+            sysdata_fields <- new_spinlock!(0u32),
+            msg_counter <- new_spinlock!(0u32),
             userdata_group <- configfs::Group::new_embedded(
                 c_str!("userdata"),
-                &USERDATA_ITEM_TYPE,
+                userdata_item_type(),
                 Userdata::new(),
             ),
         })
@@ -642,32 +660,79 @@ impl NetconsoleTarget {
     fn send_msg(&self, msg: &[u8]) {
         let np_guard = self.netpoll.lock();
         if let Some(ref np) = *np_guard {
-            // Check if we have userdata to append
-            let cache = self.userdata_cache.lock();
-            let result = if cache.len > 0 {
-                if let Some(ref data) = cache.data {
-                    // We need to combine msg + userdata
-                    // For simplicity, we send them as two separate packets
-                    // since allocating in atomic context is problematic.
-                    // First send the main message
-                    let r1 = np.send_udp(msg);
-                    // Then send the userdata
-                    let r2 = np.send_udp(data.as_slice());
-                    r1.and(r2)
-                } else {
-                    np.send_udp(msg)
-                }
-            } else {
-                drop(cache);
-                np.send_udp(msg)
-            };
+            // Send main message
+            let r1 = np.send_udp(msg);
 
-            if let Err(_) = result {
+            // Send userdata if present
+            let cache = self.userdata_cache.lock();
+            if cache.len > 0 {
+                if let Some(ref data) = cache.data {
+                    let _ = np.send_udp(data.as_slice());
+                }
+            }
+            drop(cache);
+
+            // Send sysdata if any features enabled
+            let fields = *self.sysdata_fields.lock();
+            if fields != 0 {
+                let mut sysdata_buf = [0u8; 256 * MAX_SYSDATA_ITEMS];
+                let sysdata_len = self.prepare_sysdata(fields, &mut sysdata_buf);
+                if sysdata_len > 0 {
+                    let _ = np.send_udp(&sysdata_buf[..sysdata_len]);
+                }
+            }
+
+            if let Err(_) = r1 {
                 drop(np_guard);
                 let mut errors = self.xmit_errors.lock();
                 *errors += 1;
             }
         }
+    }
+
+    /// Prepares sysdata fields into the given buffer.
+    /// Returns the number of bytes written.
+    fn prepare_sysdata(&self, fields: u32, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+
+        if fields & SYSDATA_CPU_NR != 0 {
+            let cpu = kernel::cpu::CpuId::current().as_u32();
+            offset += format_sysdata_u32(&mut buf[offset..], b"cpu", cpu);
+        }
+        if fields & SYSDATA_TASKNAME != 0 {
+            // SAFETY: get_current() always returns a valid pointer to the current task.
+            let comm = unsafe {
+                let task = bindings::get_current();
+                &(*task).comm
+            };
+            let comm_len = comm.iter().position(|&c| c == 0).unwrap_or(comm.len());
+            let comm_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(comm.as_ptr().cast(), comm_len)
+            };
+            offset += format_sysdata_bytes(&mut buf[offset..], b"taskname", comm_bytes);
+        }
+        if fields & SYSDATA_RELEASE != 0 {
+            // SAFETY: init_uts_ns is a valid global that is always initialized.
+            // Use raw pointer to avoid creating a shared reference to a mutable static.
+            let release = unsafe {
+                let ptr = &raw const bindings::init_uts_ns;
+                &(*ptr).name.release
+            };
+            let rel_len = release.iter().position(|&c| c == 0).unwrap_or(release.len());
+            let rel_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(release.as_ptr().cast(), rel_len)
+            };
+            offset += format_sysdata_bytes(&mut buf[offset..], b"release", rel_bytes);
+        }
+        if fields & SYSDATA_MSGID != 0 {
+            let mut counter = self.msg_counter.lock();
+            *counter = counter.wrapping_add(1);
+            let id = *counter;
+            drop(counter);
+            offset += format_sysdata_u32(&mut buf[offset..], b"msgid", id);
+        }
+
+        offset
     }
 }
 
@@ -1387,6 +1452,118 @@ impl configfs::GroupOperations for Userdata {
     }
 }
 
+// Sysdata Attribute 0 for Userdata: cpu_nr_enabled (read-write)
+#[vtable]
+impl configfs::AttributeOperations<0> for Userdata {
+    type Data = Userdata;
+
+    fn show(container: &Userdata, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
+        // SAFETY: The target pointer was set during initialization and is valid.
+        let target = unsafe { &*container.target() };
+        let enabled = (*target.sysdata_fields.lock() & SYSDATA_CPU_NR) != 0;
+        let s = if enabled { b"1\n" } else { b"0\n" };
+        page[..s.len()].copy_from_slice(s);
+        Ok(s.len())
+    }
+
+    fn store(container: &Userdata, page: &[u8]) -> Result {
+        let val = parse_bool(page)?;
+        // SAFETY: The target pointer was set during initialization and is valid.
+        let target = unsafe { &*container.target() };
+        let mut fields = target.sysdata_fields.lock();
+        if val {
+            *fields |= SYSDATA_CPU_NR;
+        } else {
+            *fields &= !SYSDATA_CPU_NR;
+        }
+        Ok(())
+    }
+}
+
+// Sysdata Attribute 1 for Userdata: taskname_enabled (read-write)
+#[vtable]
+impl configfs::AttributeOperations<1> for Userdata {
+    type Data = Userdata;
+
+    fn show(container: &Userdata, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
+        // SAFETY: The target pointer was set during initialization and is valid.
+        let target = unsafe { &*container.target() };
+        let enabled = (*target.sysdata_fields.lock() & SYSDATA_TASKNAME) != 0;
+        let s = if enabled { b"1\n" } else { b"0\n" };
+        page[..s.len()].copy_from_slice(s);
+        Ok(s.len())
+    }
+
+    fn store(container: &Userdata, page: &[u8]) -> Result {
+        let val = parse_bool(page)?;
+        // SAFETY: The target pointer was set during initialization and is valid.
+        let target = unsafe { &*container.target() };
+        let mut fields = target.sysdata_fields.lock();
+        if val {
+            *fields |= SYSDATA_TASKNAME;
+        } else {
+            *fields &= !SYSDATA_TASKNAME;
+        }
+        Ok(())
+    }
+}
+
+// Sysdata Attribute 2 for Userdata: release_enabled (read-write)
+#[vtable]
+impl configfs::AttributeOperations<2> for Userdata {
+    type Data = Userdata;
+
+    fn show(container: &Userdata, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
+        // SAFETY: The target pointer was set during initialization and is valid.
+        let target = unsafe { &*container.target() };
+        let enabled = (*target.sysdata_fields.lock() & SYSDATA_RELEASE) != 0;
+        let s = if enabled { b"1\n" } else { b"0\n" };
+        page[..s.len()].copy_from_slice(s);
+        Ok(s.len())
+    }
+
+    fn store(container: &Userdata, page: &[u8]) -> Result {
+        let val = parse_bool(page)?;
+        // SAFETY: The target pointer was set during initialization and is valid.
+        let target = unsafe { &*container.target() };
+        let mut fields = target.sysdata_fields.lock();
+        if val {
+            *fields |= SYSDATA_RELEASE;
+        } else {
+            *fields &= !SYSDATA_RELEASE;
+        }
+        Ok(())
+    }
+}
+
+// Sysdata Attribute 3 for Userdata: msgid_enabled (read-write)
+#[vtable]
+impl configfs::AttributeOperations<3> for Userdata {
+    type Data = Userdata;
+
+    fn show(container: &Userdata, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
+        // SAFETY: The target pointer was set during initialization and is valid.
+        let target = unsafe { &*container.target() };
+        let enabled = (*target.sysdata_fields.lock() & SYSDATA_MSGID) != 0;
+        let s = if enabled { b"1\n" } else { b"0\n" };
+        page[..s.len()].copy_from_slice(s);
+        Ok(s.len())
+    }
+
+    fn store(container: &Userdata, page: &[u8]) -> Result {
+        let val = parse_bool(page)?;
+        // SAFETY: The target pointer was set during initialization and is valid.
+        let target = unsafe { &*container.target() };
+        let mut fields = target.sysdata_fields.lock();
+        if val {
+            *fields |= SYSDATA_MSGID;
+        } else {
+            *fields &= !SYSDATA_MSGID;
+        }
+        Ok(())
+    }
+}
+
 // Attribute 0 for UserdataEntry: value (read-write)
 #[vtable]
 impl configfs::AttributeOperations<0> for UserdataEntry {
@@ -1475,6 +1652,66 @@ fn format_u64(buf: &mut [u8; 32], val: u64) -> &[u8] {
         n /= 10;
     }
     &buf[i..]
+}
+
+/// Format a u32 into a byte buffer, returning the formatted slice.
+fn format_u32(buf: &mut [u8; 16], val: u32) -> &[u8] {
+    let mut n = val;
+    let mut i = buf.len();
+    if n == 0 {
+        buf[buf.len() - 1] = b'0';
+        return &buf[buf.len() - 1..];
+    }
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    &buf[i..]
+}
+
+/// Format a sysdata entry with a u32 value: " key=value\n"
+/// Returns the number of bytes written.
+fn format_sysdata_u32(buf: &mut [u8], key: &[u8], val: u32) -> usize {
+    let mut tmp = [0u8; 16];
+    let val_str = format_u32(&mut tmp, val);
+    let total = 1 + key.len() + 1 + val_str.len() + 1; // ' ' + key + '=' + val + '\n'
+    if buf.len() < total {
+        return 0;
+    }
+    let mut offset = 0;
+    buf[offset] = b' ';
+    offset += 1;
+    buf[offset..offset + key.len()].copy_from_slice(key);
+    offset += key.len();
+    buf[offset] = b'=';
+    offset += 1;
+    buf[offset..offset + val_str.len()].copy_from_slice(val_str);
+    offset += val_str.len();
+    buf[offset] = b'\n';
+    offset += 1;
+    offset
+}
+
+/// Format a sysdata entry with a byte slice value: " key=value\n"
+/// Returns the number of bytes written.
+fn format_sysdata_bytes(buf: &mut [u8], key: &[u8], val: &[u8]) -> usize {
+    let total = 1 + key.len() + 1 + val.len() + 1; // ' ' + key + '=' + val + '\n'
+    if buf.len() < total {
+        return 0;
+    }
+    let mut offset = 0;
+    buf[offset] = b' ';
+    offset += 1;
+    buf[offset..offset + key.len()].copy_from_slice(key);
+    offset += key.len();
+    buf[offset] = b'=';
+    offset += 1;
+    buf[offset..offset + val.len()].copy_from_slice(val);
+    offset += val.len();
+    buf[offset] = b'\n';
+    offset += 1;
+    offset
 }
 
 /// Trim trailing newline from a byte slice.
