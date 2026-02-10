@@ -383,7 +383,7 @@ config NETCONSOLE_C
 
 config NETCONSOLE_RUST
 	bool "Rust implementation"
-	depends on RUST && CONFIGFS_FS
+	depends on RUST
 	help
 	  Use the Rust implementation of netconsole. This provides the same
 	  functionality as the C implementation but is written in Rust for
