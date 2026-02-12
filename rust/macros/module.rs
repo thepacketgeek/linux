@@ -436,6 +436,53 @@ macro_rules! parse_ordered_fields {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitCallLevel {
+    Pure,
+    Core,
+    PostCore,
+    Arch,
+    Subsys,
+    Fs,
+    Device,
+    Late,
+}
+
+impl InitCallLevel {
+    fn section(&self) -> &'static str {
+        match self {
+            Self::Pure => ".initcall0.init",
+            Self::Core => ".initcall1.init",
+            Self::PostCore => ".initcall2.init",
+            Self::Arch => ".initcall3.init",
+            Self::Subsys => ".initcall4.init",
+            Self::Fs => ".initcall5.init",
+            Self::Device => ".initcall6.init",
+            Self::Late => ".initcall7.init",
+        }
+    }
+}
+
+impl Parse for InitCallLevel {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let ident: Ident = input.call(Ident::parse_any)?;
+        match ident.to_string().as_str() {
+            "pure" => Ok(Self::Pure),
+            "core" => Ok(Self::Core),
+            "postcore" => Ok(Self::PostCore),
+            "arch" => Ok(Self::Arch),
+            "subsys" => Ok(Self::Subsys),
+            "fs" => Ok(Self::Fs),
+            "device" => Ok(Self::Device),
+            "late" => Ok(Self::Late),
+            _ => Err(Error::new_spanned(
+                ident,
+                "invalid initcall level. Valid values are: pure, core, postcore, arch, subsys, fs, device, late",
+            )),
+        }
+    }
+}
+
 struct Parameter {
     name: Ident,
     ptype: Type,
@@ -480,6 +527,7 @@ pub(crate) struct ModuleInfo {
     firmware: Option<Punctuated<AsciiLitStr, Token![,]>>,
     imports_ns: Option<Punctuated<AsciiLitStr, Token![,]>>,
     params: Option<Punctuated<Parameter, Token![,]>>,
+    initcall: Option<InitCallLevel>,
 }
 
 impl Parse for ModuleInfo {
@@ -515,6 +563,7 @@ impl Parse for ModuleInfo {
                 braced!(list in input);
                 Punctuated::parse_terminated(&list)?
             },
+            initcall => input.parse()?,
         );
 
         Ok(ModuleInfo {
@@ -527,6 +576,7 @@ impl Parse for ModuleInfo {
             firmware,
             imports_ns,
             params,
+            initcall,
         })
     }
 }
@@ -542,6 +592,7 @@ pub(crate) fn module(info: ModuleInfo) -> Result<TokenStream> {
         firmware,
         imports_ns,
         params: _,
+        initcall,
     } = &info;
 
     // Rust does not allow hyphens in identifiers, use underscore instead.
@@ -587,7 +638,10 @@ pub(crate) fn module(info: ModuleInfo) -> Result<TokenStream> {
     let ident_init = format_ident!("__{ident}_init");
     let ident_exit = format_ident!("__{ident}_exit");
     let ident_initcall = format_ident!("__{ident}_initcall");
-    let initcall_section = ".initcall6.init";
+    let initcall_section = initcall
+        .as_ref()
+        .unwrap_or(&InitCallLevel::Device)
+        .section();
 
     let global_asm = format!(
         r#".section "{initcall_section}", "a"

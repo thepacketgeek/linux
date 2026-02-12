@@ -135,6 +135,10 @@ use syn::parse_macro_input;
 ///   - `alias`: array of ASCII string literals of the alias names of the kernel module.
 ///   - `firmware`: array of ASCII string literals of the firmware files of
 ///     the kernel module.
+///   - `initcall`: initcall level for built-in modules. Valid values are:
+///     `pure` (0), `core` (1), `postcore` (2), `arch` (3), `subsys` (4),
+///     `fs` (5), `device` (6, the default), and `late` (7).
+///     This only affects built-in modules; loadable modules always use `init_module()`.
 #[proc_macro]
 pub fn module(input: TokenStream) -> TokenStream {
     module::module(parse_macro_input!(input))
