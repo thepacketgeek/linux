@@ -45,6 +45,21 @@ unsafe impl Sync for ObsKernelParam {}
 pub trait ModuleParam: Sized + Copy {
     /// Parse a parameter argument into the parameter value.
     fn try_from_param_arg(arg: &BStr) -> Result<Self>;
+
+    /// Create a parameter value from a raw `__setup` callback argument.
+    ///
+    /// Default implementation: parse the null-terminated C string via
+    /// [`ModuleParam::try_from_param_arg`]. `StringParam` overrides this to store the pointer
+    /// directly.
+    ///
+    /// # Safety
+    ///
+    /// `val` must point to a valid null-terminated string.
+    unsafe fn from_setup_arg(val: *const c_char) -> Result<Self> {
+        // SAFETY: Caller guarantees `val` points to a valid null-terminated string.
+        let cstr = unsafe { CStr::from_char_ptr(val) };
+        Self::try_from_param_arg(cstr.as_ref())
+    }
 }
 
 /// Set the module parameter from a string.
@@ -226,6 +241,12 @@ impl ModuleParam for StringParam {
         // when using PARAM_OPS_STRING.
         Err(EINVAL)
     }
+
+    unsafe fn from_setup_arg(val: *const c_char) -> Result<Self> {
+        // SAFETY: Caller guarantees `val` points to a valid null-terminated string.
+        // The pointer comes from `static_command_line` which is valid for the kernel's lifetime.
+        Ok(unsafe { StringParam::from_ptr(val) })
+    }
 }
 
 /// A wrapper for kernel parameters.
@@ -265,6 +286,14 @@ impl<T> ModuleParamAccess<T> {
     /// NOTE: In most cases it is not safe deref the returned pointer.
     pub const fn as_void_ptr(&self) -> *mut c_void {
         core::ptr::from_ref(self).cast_mut().cast()
+    }
+
+    /// Set the parameter value directly.
+    ///
+    /// Returns `true` if successfully set, `false` if already populated
+    /// (first-write-wins semantics via [`SetOnce`]).
+    pub fn set_value(&self, val: T) -> bool {
+        self.value.populate(val)
     }
 }
 
