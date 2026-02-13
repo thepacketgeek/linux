@@ -8,7 +8,8 @@ use proc_macro2::{
 };
 use quote::{
     format_ident,
-    quote, //
+    quote,
+    ToTokens, //
 };
 use syn::{
     braced,
@@ -120,13 +121,15 @@ impl<'a> ModInfoBuilder<'a> {
 
         for param in params {
             let param_name_str = param.name.to_string();
-            let param_type_str = param.ptype.to_string();
+            let param_type_str = param.ptype.to_token_stream().to_string();
+            // Clean up the type string for modinfo (remove spaces around ::)
+            let param_type_clean = param_type_str.replace(" ", "");
 
             let ops = param_ops_path(&param_type_str);
 
             // Note: The spelling of these fields is dictated by the user space
             // tool `modinfo`.
-            self.emit_param("parmtype", &param_name_str, &param_type_str);
+            self.emit_param("parmtype", &param_name_str, &param_type_clean);
             self.emit_param("parm", &param_name_str, &param.description.value());
 
             let static_name = format_ident!("__{}_{}_struct", self.module, param.name);
@@ -137,14 +140,32 @@ impl<'a> ModInfoBuilder<'a> {
                     .expect("name contains NUL-terminator");
 
             let param_name = &param.name;
-            let param_type = &param.ptype;
             let param_default = &param.default;
+
+            // `string` is a shorthand for `StringParam` in the macro — resolve to
+            // the real type for code generation.
+            let is_str_param = param_type_str == "string";
+            let actual_type: Type = if is_str_param {
+                parse_quote!(::kernel::module_param::StringParam)
+            } else {
+                param.ptype.clone()
+            };
+
+            // For `string` params the default is always a string literal which
+            // gets wrapped with StringParam::from_c_str(kernel::c_str!(...)).
+            let default_expr = if is_str_param {
+                quote! {
+                    ::kernel::module_param::StringParam::from_c_str(::kernel::c_str!(#param_default))
+                }
+            } else {
+                quote!(#param_default)
+            };
 
             self.param_ts.extend(quote! {
                 #[allow(non_upper_case_globals)]
                 pub(crate) static #param_name:
-                    ::kernel::module_param::ModuleParamAccess<#param_type> =
-                        ::kernel::module_param::ModuleParamAccess::new(#param_default);
+                    ::kernel::module_param::ModuleParamAccess<#actual_type> =
+                        ::kernel::module_param::ModuleParamAccess::new(#default_expr);
 
                 const _: () = {
                     #[allow(non_upper_case_globals)]
@@ -186,7 +207,9 @@ impl<'a> ModInfoBuilder<'a> {
 }
 
 fn param_ops_path(param_type: &str) -> Path {
-    match param_type {
+    let type_name = param_type.rsplit("::").next().unwrap_or(param_type).trim();
+
+    match type_name {
         "i8" => parse_quote!(::kernel::module_param::PARAM_OPS_I8),
         "u8" => parse_quote!(::kernel::module_param::PARAM_OPS_U8),
         "i16" => parse_quote!(::kernel::module_param::PARAM_OPS_I16),
@@ -197,6 +220,7 @@ fn param_ops_path(param_type: &str) -> Path {
         "u64" => parse_quote!(::kernel::module_param::PARAM_OPS_U64),
         "isize" => parse_quote!(::kernel::module_param::PARAM_OPS_ISIZE),
         "usize" => parse_quote!(::kernel::module_param::PARAM_OPS_USIZE),
+        "string" => parse_quote!(::kernel::module_param::PARAM_OPS_STRING),
         t => panic!("Unsupported parameter type {}", t),
     }
 }
@@ -340,7 +364,7 @@ macro_rules! parse_ordered_fields {
 
 struct Parameter {
     name: Ident,
-    ptype: Ident,
+    ptype: Type,
     default: Expr,
     description: LitStr,
 }
@@ -349,7 +373,7 @@ impl Parse for Parameter {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let name = input.parse()?;
         input.parse::<Token![:]>()?;
-        let ptype = input.parse()?;
+        let ptype: Type = input.parse()?;
 
         let fields;
         braced!(fields in input);

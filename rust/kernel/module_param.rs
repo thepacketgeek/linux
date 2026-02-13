@@ -86,6 +86,36 @@ where
     })
 }
 
+/// Set a string module parameter from a string.
+///
+/// Similar to [`set_param`] but for [`StringParam`].
+///
+/// # Safety
+///
+/// Same requirements as [`set_param`].
+unsafe extern "C" fn set_string_param(
+    val: *const c_char,
+    param: *const bindings::kernel_param,
+) -> c_int {
+    if val.is_null() {
+        crate::pr_warn!("Null pointer passed to `module_param::set_string_param`");
+        return EINVAL.to_errno();
+    }
+
+    crate::error::from_result(|| {
+        // SAFETY: val points to a valid C string from the kernel.
+        let cstr_param = unsafe { StringParam::from_ptr(val) };
+
+        // SAFETY: By function safety requirements, param.arg points to our SetOnce<StringParam>.
+        let container = unsafe { &*((*param).__bindgen_anon_1.arg.cast::<SetOnce<StringParam>>()) };
+
+        container
+            .populate(cstr_param)
+            .then_some(0)
+            .ok_or(kernel::error::code::EEXIST)
+    })
+}
+
 macro_rules! impl_int_module_param {
     ($ty:ident) => {
         impl ModuleParam for $ty {
@@ -175,6 +205,15 @@ impl StringParam {
 unsafe impl Send for StringParam {}
 unsafe impl Sync for StringParam {}
 
+impl ModuleParam for StringParam {
+    fn try_from_param_arg(_arg: &BStr) -> Result<Self> {
+        // For StringParam, we don't parse here - the kernel's set callback
+        // directly stores the pointer. This method should not be called
+        // when using PARAM_OPS_STRING.
+        Err(EINVAL)
+    }
+}
+
 /// A wrapper for kernel parameters.
 ///
 /// This type is instantiated by the [`module!`] macro when module parameters are
@@ -249,3 +288,12 @@ make_param_ops!(PARAM_OPS_I64, i64);
 make_param_ops!(PARAM_OPS_U64, u64);
 make_param_ops!(PARAM_OPS_ISIZE, isize);
 make_param_ops!(PARAM_OPS_USIZE, usize);
+
+/// Parameter ops for string parameters.
+#[doc(hidden)]
+pub static PARAM_OPS_STRING: bindings::kernel_param_ops = bindings::kernel_param_ops {
+    flags: 0,
+    set: Some(set_string_param),
+    get: None,
+    free: None,
+};
