@@ -26,6 +26,20 @@ impl KernelParam {
 // from Rust module.
 unsafe impl Sync for KernelParam {}
 
+/// Placed in the `.init.setup` ELF section by the `module!` macro.
+#[repr(C)]
+pub struct ObsKernelParam {
+    /// Pointer to the null-terminated setup string (e.g., `"netconsole=\0"`).
+    pub str_: *const c_char,
+    /// The setup callback function.
+    pub setup_func: Option<unsafe extern "C" fn(*mut c_char) -> c_int>,
+    /// Whether this is an early parameter (0 for `__setup`, 1 for `early_param`).
+    pub early: c_int,
+}
+
+// SAFETY: Only written at compile time, read during single-threaded boot init.
+unsafe impl Sync for ObsKernelParam {}
+
 /// Types that can be used for module parameters.
 // NOTE: This trait is `Copy` because drop could produce unsoundness during teardown.
 pub trait ModuleParam: Sized + Copy {
