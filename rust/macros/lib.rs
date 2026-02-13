@@ -35,8 +35,13 @@ use syn::parse_macro_input;
 /// parameter_name: type {
 ///     default: default_value,
 ///     description: "Description",
+///     early_param: "cmdline_prefix=",  // optional
 /// }
 /// ```
+///
+/// The optional `early_param` field registers the parameter as an early
+/// boot command-line parameter via `__setup`. The value is the command-line
+/// prefix string (e.g. `"netconsole="`).
 ///
 /// `type` may be one of
 ///

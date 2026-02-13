@@ -38,6 +38,7 @@ struct ModInfoBuilder<'a> {
     counter: usize,
     ts: TokenStream,
     param_ts: TokenStream,
+    setup_ts: TokenStream,
 }
 
 impl<'a> ModInfoBuilder<'a> {
@@ -47,6 +48,7 @@ impl<'a> ModInfoBuilder<'a> {
             counter: 0,
             ts: TokenStream::new(),
             param_ts: TokenStream::new(),
+            setup_ts: TokenStream::new(),
         }
     }
 
@@ -200,6 +202,78 @@ impl<'a> ModInfoBuilder<'a> {
                                 },
                             }
                         );
+                };
+            });
+        }
+    }
+
+    fn emit_setup(&mut self, info: &ModuleInfo) {
+        let Some(params) = &info.params else {
+            return;
+        };
+
+        for param in params {
+            let Some(early_param) = &param.early_param else {
+                continue;
+            };
+
+            let setup_str_value = early_param.value();
+            let param_name = &param.name;
+
+            // Resolve `string` shorthand to the real `StringParam` type.
+            let param_type_str = param.ptype.to_token_stream().to_string();
+            let actual_type: Type = if param_type_str == "string" {
+                parse_quote!(::kernel::module_param::StringParam)
+            } else {
+                param.ptype.clone()
+            };
+
+            // Create identifiers for the generated statics
+            let setup_fn_name = format_ident!("__setup_fn_{}", param_name);
+            let setup_str_name =
+                format_ident!("__SETUP_STR_{}", param_name.to_string().to_uppercase());
+            let setup_name = format_ident!("__SETUP_{}", param_name.to_string().to_uppercase());
+
+            // The setup string with null terminator
+            let setup_str_bytes = format!("{}\0", setup_str_value);
+            let setup_str_len = setup_str_bytes.len();
+            let setup_str_lit = Literal::byte_string(setup_str_bytes.as_bytes());
+
+            self.setup_ts.extend(quote! {
+                #[cfg(not(MODULE))]
+                const _: () = {
+                    unsafe extern "C" fn #setup_fn_name(
+                        val: *mut ::kernel::ffi::c_char,
+                    ) -> ::kernel::ffi::c_int {
+                        if val.is_null() {
+                            return 0;
+                        }
+                        // SAFETY: The kernel passes a valid null-terminated string from
+                        // `static_command_line`.
+                        match unsafe {
+                            <#actual_type as ::kernel::module_param::ModuleParam>::from_setup_arg(
+                                val as *const _
+                            )
+                        } {
+                            Ok(v) => {
+                                if module_parameters::#param_name.set_value(v) { 1 } else { 0 }
+                            }
+                            Err(_) => 0,
+                        }
+                    }
+
+                    #[link_section = ".init.rodata"]
+                    #[used(compiler)]
+                    static #setup_str_name: [u8; #setup_str_len] = *#setup_str_lit;
+
+                    #[link_section = ".init.setup"]
+                    #[used(compiler)]
+                    static #setup_name: ::kernel::module_param::ObsKernelParam =
+                        ::kernel::module_param::ObsKernelParam {
+                            str_: #setup_str_name.as_ptr().cast(),
+                            setup_func: ::core::option::Option::Some(#setup_fn_name),
+                            early: 0,
+                        };
                 };
             });
         }
@@ -367,6 +441,7 @@ struct Parameter {
     ptype: Type,
     default: Expr,
     description: LitStr,
+    early_param: Option<LitStr>,
 }
 
 impl Parse for Parameter {
@@ -382,6 +457,7 @@ impl Parse for Parameter {
             from fields;
             default [required] => fields.parse()?,
             description [required] => fields.parse()?,
+            early_param => fields.parse()?,
         }
 
         Ok(Self {
@@ -389,6 +465,7 @@ impl Parse for Parameter {
             ptype,
             default,
             description,
+            early_param,
         })
     }
 }
@@ -501,9 +578,11 @@ pub(crate) fn module(info: ModuleInfo) -> Result<TokenStream> {
     modinfo.emit_only_builtin("file", &file, false);
 
     modinfo.emit_params(&info);
+    modinfo.emit_setup(&info);
 
     let modinfo_ts = modinfo.ts;
     let params_ts = modinfo.param_ts;
+    let setup_ts = modinfo.setup_ts;
 
     let ident_init = format_ident!("__{ident}_init");
     let ident_exit = format_ident!("__{ident}_exit");
@@ -678,5 +757,7 @@ pub(crate) fn module(info: ModuleInfo) -> Result<TokenStream> {
         mod module_parameters {
             #params_ts
         }
+
+        #setup_ts
     })
 }
