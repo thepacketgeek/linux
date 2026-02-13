@@ -6,6 +6,7 @@
 
 use crate::prelude::*;
 use crate::str::BStr;
+use crate::str::CStr;
 use bindings;
 use kernel::sync::SetOnce;
 
@@ -105,6 +106,74 @@ impl_int_module_param!(i64);
 impl_int_module_param!(u64);
 impl_int_module_param!(isize);
 impl_int_module_param!(usize);
+
+/// A module parameter that holds a C string pointer.
+///
+/// This type is `Copy` by storing only a raw pointer. The underlying string
+/// memory is managed by the kernel's parameter subsystem.
+///
+/// # Safety
+///
+/// The pointer is only valid while the module is loaded. The kernel ensures
+/// the string memory remains valid for the module's lifetime.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct StringParam {
+    ptr: *const c_char,
+}
+
+impl StringParam {
+    /// Creates a new `StringParam` from a raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must be valid and point to a null-terminated string,
+    /// or be null for an empty/unset parameter.
+    pub const unsafe fn from_ptr(ptr: *const c_char) -> Self {
+        Self { ptr }
+    }
+
+    /// Creates a `StringParam` from a static `CStr` reference.
+    ///
+    /// Useful for compile-time default values in module parameter declarations.
+    pub const fn from_c_str(s: &'static CStr) -> Self {
+        Self {
+            ptr: crate::str::as_char_ptr_in_const_context(s),
+        }
+    }
+
+    /// Creates a null/empty `StringParam`.
+    pub const fn null() -> Self {
+        Self {
+            ptr: core::ptr::null(),
+        }
+    }
+
+    /// Returns `true` if the parameter is null/unset.
+    pub fn is_null(&self) -> bool {
+        self.ptr.is_null()
+    }
+
+    /// Returns the string as a `CStr` reference, if set.
+    pub fn as_cstr(&self) -> Option<&CStr> {
+        if self.ptr.is_null() {
+            None
+        } else {
+            // SAFETY: pointer validity is checked above
+            Some(unsafe { CStr::from_char_ptr(self.ptr) })
+        }
+    }
+
+    /// Returns the string as bytes, if set.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        self.as_cstr().map(|s| s.to_bytes())
+    }
+}
+
+// SAFETY: The pointer is managed by the kernel and is effectively 'static
+// for the module's lifetime.
+unsafe impl Send for StringParam {}
+unsafe impl Sync for StringParam {}
 
 /// A wrapper for kernel parameters.
 ///
