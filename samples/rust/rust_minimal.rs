@@ -35,6 +35,8 @@ module! {
         test_str: string {
             default: "hello",
             description: "This parameter has a default of hello",
+            // This will allow the arg to be used in kernel cmdline without dotted notation
+            early_param: "testing_early_str=",
         }
     },
 }
