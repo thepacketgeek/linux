@@ -2,5 +2,8 @@
 
 //! Networking.
 
+pub mod mac;
+pub use mac::MacAddr;
+
 #[cfg(CONFIG_RUST_PHYLIB_ABSTRACTIONS)]
 pub mod phy;
